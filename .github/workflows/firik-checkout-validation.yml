@@ -1,0 +1,59 @@
+name: Firik checkout regression validation
+on:
+  push:
+    branches: [ci/firik-checkout-validation]
+permissions:
+  contents: read
+jobs:
+  checkout-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup-woocommerce-monorepo
+        with:
+          install: '@woocommerce/plugin-woocommerce...'
+          build: '@woocommerce/plugin-woocommerce'
+          build-type: backend
+          php-version: '8.1'
+      - name: Fetch upstream base
+        run: git fetch origin trunk:refs/remotes/origin/trunk --depth=1
+      - name: Check PHP changes and branch coding standards
+        run: |
+          source=plugins/woocommerce/includes/shortcodes/class-wc-shortcode-checkout.php
+          cp "$source" /tmp/patched-checkout.php
+          git show origin/trunk:"$source" > "$source"
+          pnpm --filter=@woocommerce/plugin-woocommerce lint:php:changes
+          cp /tmp/patched-checkout.php "$source"
+          pnpm --filter=@woocommerce/plugin-woocommerce lint:changes:branch
+      - name: Analyze modified PHP
+        working-directory: plugins/woocommerce
+        run: |
+          printf 'includes:\n  - phpstan.neon\nparameters:\n  reportUnmatchedIgnoredErrors: false\n' > phpstan-firik.neon
+          composer exec -- phpstan analyse -c phpstan-firik.neon includes/shortcodes/class-wc-shortcode-checkout.php --memory-limit=2G
+      - name: Start isolated WordPress test environment
+        run: pnpm --filter=@woocommerce/plugin-woocommerce env:test:start
+      - name: Prove regression tests fail on the unpatched source
+        run: |
+          source=plugins/woocommerce/includes/shortcodes/class-wc-shortcode-checkout.php
+          git show origin/trunk:"$source" > "$source"
+          set +e
+          pnpm --filter=@woocommerce/plugin-woocommerce test:php:env --filter test_order_received_respects_ 2>&1 | tee /tmp/woocommerce-baseline.log
+          result=${PIPESTATUS[0]}
+          set -e
+          cp /tmp/patched-checkout.php "$source"
+          test "$result" -ne 0
+          grep -q 'Rendering a receipt must not override' /tmp/woocommerce-baseline.log
+      - name: Test checkout and cart functions with the fix
+        run: |
+          set -o pipefail
+          pnpm --filter=@woocommerce/plugin-woocommerce test:php:env --filter 'WC_Shortcode_Checkout_Test|WC_Cart_Functions_Test' 2>&1 | tee /tmp/woocommerce-patched.log
+      - name: Test with HPOS disabled
+        run: pnpm --filter=@woocommerce/plugin-woocommerce test:php:env:hpos-off --filter WC_Shortcode_Checkout_Test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkout-regression-evidence
+          path: /tmp/woocommerce-*.log
